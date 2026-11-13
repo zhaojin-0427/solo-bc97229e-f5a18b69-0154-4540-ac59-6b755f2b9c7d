@@ -7,6 +7,16 @@
 
 同步器保证：数据行的修改与 sync_meta 进度更新在 *同一个事务* 中提交，
 因此“副本数据与进度共同提交”，崩溃后要么整批生效、要么整批回滚。
+
+就绪判定（关键）
+================
+``sync_meta.bootstrap_completed`` 是“首次复制已经完整完成”的唯一权威凭证：
+  * 它只在 bootstrap 日志重放全部完成、``phase`` 置为 RUNNING 的 *同一个
+    事务* 里翻成 1；此前无论快照拷了多少行、重放提交了多少批日志（此时
+    ``last_applied_seq`` 可能早已非零），该标记始终为 0；
+  * 重启续跑以该标记、而非“进度是否非零”为准：标记为 0 一律保守重做
+    bootstrap，绝不仅凭非零进度放行查询；
+  * 旧版本副本没有这一列，迁移时默认补 0 —— 无法证明首拷完成就重做。
 """
 from __future__ import annotations
 
@@ -66,16 +76,28 @@ def init_replica(path: str) -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_meta (
-                id               INTEGER PRIMARY KEY CHECK (id = 1),
-                phase            TEXT NOT NULL,
-                last_applied_seq INTEGER NOT NULL DEFAULT 0,
-                source_max_seq   INTEGER NOT NULL DEFAULT 0,
-                bootstrap_copied INTEGER NOT NULL DEFAULT 0,
-                last_error       TEXT,
-                updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+                id                 INTEGER PRIMARY KEY CHECK (id = 1),
+                phase              TEXT NOT NULL,
+                last_applied_seq   INTEGER NOT NULL DEFAULT 0,
+                source_max_seq     INTEGER NOT NULL DEFAULT 0,
+                bootstrap_copied   INTEGER NOT NULL DEFAULT 0,
+                bootstrap_completed INTEGER NOT NULL DEFAULT 0,
+                last_error         TEXT,
+                updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
             )
             """
         )
+        # 旧副本（没有 bootstrap_completed 列）的在线迁移：默认补 0，
+        # 即“无法证明首拷完成 -> 保守重做 bootstrap”，绝不凭非零进度放行。
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(sync_meta)")
+        }
+        if "bootstrap_completed" not in cols:
+            conn.execute(
+                "ALTER TABLE sync_meta"
+                " ADD COLUMN bootstrap_completed INTEGER NOT NULL DEFAULT 0"
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS _applied_changes (
@@ -98,6 +120,7 @@ def get_meta(path: str) -> dict:
         "last_applied_seq": 0,
         "source_max_seq": 0,
         "bootstrap_copied": 0,
+        "bootstrap_completed": 0,
         "last_error": None,
     }
     if not os.path.exists(path):
@@ -114,8 +137,19 @@ def get_meta(path: str) -> dict:
 
 
 def is_ready(path: str) -> bool:
-    """就绪前不供查询：只有 RUNNING 阶段才接受标本查询。"""
-    return os.path.exists(path) and get_meta(path)["phase"] == PHASE_RUNNING
+    """就绪前不供查询。
+
+    必须同时满足：处于 RUNNING 阶段 *且* 持久标记 bootstrap_completed=1。
+    首拷中断（含日志重放已提交若干批、last_applied_seq 非零但标记仍为 0）
+    的副本永远不可查，重启后先保守重做。
+    """
+    if not os.path.exists(path):
+        return False
+    meta = get_meta(path)
+    return (
+        meta["phase"] == PHASE_RUNNING
+        and int(meta.get("bootstrap_completed", 0)) == 1
+    )
 
 
 def get_specimen(path: str, specimen_id: int):
@@ -130,7 +164,9 @@ def get_specimen(path: str, specimen_id: int):
 def reset_for_bootstrap(path: str) -> None:
     """初次复制（重新）开始：清空一切派生数据，回到 INIT 进度。
 
-    初次复制中断后重做时调用，保证半成品快照不会残留。
+    初次复制中断后重做时调用，保证半成品快照不会残留；同时把
+    bootstrap_completed 明确清 0 —— 在新一次首拷完整跑完之前，
+    副本始终不就绪、不可查。
     """
     with open_replica(path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -140,10 +176,36 @@ def reset_for_bootstrap(path: str) -> None:
             """
             UPDATE sync_meta
                SET phase = ?, last_applied_seq = 0, source_max_seq = 0,
-                   bootstrap_copied = 0, last_error = NULL,
+                   bootstrap_copied = 0, bootstrap_completed = 0,
+                   last_error = NULL,
                    updated_at = datetime('now')
              WHERE id = 1
             """,
             (PHASE_BOOTSTRAP,),
+        )
+        conn.execute("COMMIT")
+
+
+def mark_bootstrap_running(path: str, target_seq: int) -> None:
+    """首拷正式发布：数据、进度、就绪标记在 *同一个事务* 原子生效。
+
+    只有走到这里（快照 + 日志区间 [1, w1] 全部重放完毕）才允许：
+      * bootstrap_completed -> 1（首拷完成的唯一权威凭证）；
+      * phase -> RUNNING（开始接受查询）；
+      * last_applied_seq/source_max_seq -> target_seq。
+    进程在本事务提交前的任意时刻退出，标记都保持 0，重启即保守重做。
+    """
+    with open_replica(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE sync_meta
+               SET phase = ?, last_applied_seq = ?,
+                   source_max_seq = ?, bootstrap_completed = 1,
+                   last_error = NULL,
+                   updated_at = datetime('now')
+             WHERE id = 1
+            """,
+            (PHASE_RUNNING, target_seq, target_seq),
         )
         conn.execute("COMMIT")

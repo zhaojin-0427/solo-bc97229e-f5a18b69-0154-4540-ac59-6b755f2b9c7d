@@ -289,6 +289,297 @@ class TestBootstrap:
         assert meta["phase"] == replica_db.PHASE_STOPPED
         assert meta["last_applied_seq"] == source_db.max_change_seq(src)
 
+    def test_interrupted_replay_never_publishes_replica(self, tmp_path, monkeypatch):
+        """复刻线上事故：逐条提交 501 条登记再撤回 1 号；首拷重放 500 条
+        历史日志后停止。半成品副本（进度已非零、1 号可能仍在）始终不可查，
+        重启重做后 1 号消失、其余 500 条齐全。"""
+        src = str(tmp_path / "source.db")
+        rep = str(tmp_path / "replica.db")
+        source_db.init_source(src)
+        conn = source_db.connect(src)
+        try:
+            for i in range(1, 502):  # 501 条登记，逐条提交
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO specimens VALUES (?, ?, ?)",
+                    (i, f"taxon-{i}", f"locality-{i}"),
+                )
+                conn.execute("COMMIT")
+            conn.execute("BEGIN IMMEDIATE")  # 单独撤回 1 号
+            conn.execute("DELETE FROM specimens WHERE id = 1")
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        assert source_db.max_change_seq(src) == 502
+
+        # 每批 500 条：重放提交第 500 条（501 条 I 的前 500 条）后、
+        # 发布就绪前确定性打断
+        monkeypatch.setattr(source_db, "CHANGE_BATCH_SIZE", 500)
+        monkeypatch.setattr("app.sync.CHANGE_BATCH_SIZE", 500, raising=False)
+        monkeypatch.setattr(source_db, "SNAPSHOT_PAGE_SIZE", 500)
+        monkeypatch.setattr("app.sync.SNAPSHOT_PAGE_SIZE", 500, raising=False)
+
+        engine = SyncEngine(src, rep, poll_interval=0.02)
+
+        def stop_after_500(seq):
+            if seq == 500:
+                engine.stop()
+
+        engine.after_batch_commit = stop_after_500
+        engine.start()
+        engine.wait_until_idle(20)
+
+        meta = replica_db.get_meta(rep)
+        # 进度确实已推进到非零（旧代码据此误判就绪的根因）
+        assert meta["last_applied_seq"] == 500
+        # 但就绪标记未发布、阶段不是 RUNNING、查询被拒绝
+        assert meta["bootstrap_completed"] == 0
+        assert meta["phase"] != replica_db.PHASE_RUNNING
+        assert replica_db.is_ready(rep) is False
+        # 此时 1 号的 D 事件尚未重放，物理上可能还在半成品副本里——
+        # 关键是就绪门未开（is_ready=False，Web 层据此返回 503），对外不可查
+        assert replica_db.is_ready(rep) is False
+        with replica_db.open_replica(rep) as rconn:
+            physical = rconn.execute(
+                "SELECT id FROM specimens WHERE id = 1"
+            ).fetchone()
+        if physical is not None:
+            # 半成品里残留的 1 号必须随重做被撤回，且全程未对外发布
+            assert replica_db.is_ready(rep) is False
+
+        # 模拟进程重启：新引擎实例。重做期间始终 503，发布后才可查
+        engine2 = SyncEngine(src, rep, poll_interval=0.02)
+        engine2.start()
+        saw_not_ready = False
+        became_ready = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if not replica_db.is_ready(rep):
+                saw_not_ready = True
+            else:
+                became_ready = True
+                break
+            time.sleep(0.005)
+        assert saw_not_ready and became_ready
+
+        # 发布瞬间数据已一致：1 号撤回生效，其余 500 条齐全
+        assert replica_db.get_specimen(rep, 1) is None
+        with replica_db.open_replica(rep) as rconn:
+            count = rconn.execute("SELECT COUNT(*) c FROM specimens").fetchone()["c"]
+        assert count == 500
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 1
+        assert meta["last_applied_seq"] == 502
+        engine2.stop()
+        engine2.wait_until_idle(20)
+
+    def test_redo_bootstrap_while_source_keeps_changing(self, tmp_path, monkeypatch):
+        """未完成首拷可重做，重做期间源库仍可持续增删改，最终一致。"""
+        src = str(tmp_path / "source.db")
+        rep = str(tmp_path / "replica.db")
+        source_db.init_demo(
+            src, rows=[(i, f"taxon-{i}", f"locality-{i}") for i in range(1, 11)]
+        )
+        monkeypatch.setattr(source_db, "SNAPSHOT_PAGE_SIZE", 2)
+        monkeypatch.setattr("app.sync.SNAPSHOT_PAGE_SIZE", 2, raising=False)
+
+        # 第一次首拷：快照第一页提交后确定性停止，留下未发布的半成品
+        engine = SyncEngine(src, rep, poll_interval=0.02)
+
+        def stop_after_first_page(copied):
+            engine.stop()
+
+        engine.after_snapshot_page = stop_after_first_page
+        engine.start()
+        engine.wait_until_idle(10)
+        assert replica_db.get_meta(rep)["bootstrap_completed"] == 0
+        assert replica_db.is_ready(rep) is False
+
+        # 重做期间源库持续增 / 改 / 撤
+        stop_flag = threading.Event()
+
+        def writer():
+            n = 5000
+            while not stop_flag.is_set():
+                n += 1
+                try:
+                    source_db.insert_specimen(src, n, f"t-{n}", "concurrent")
+                    source_db.update_specimen(src, 1, f"rev-{n}", "new-loc")
+                    if n % 4 == 0:
+                        source_db.delete_specimen(src, n)
+                except Exception:
+                    pass
+                time.sleep(0.002)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            engine2 = SyncEngine(src, rep, poll_interval=0.02)
+            engine2.start()
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if replica_db.get_meta(rep)["bootstrap_completed"] == 1:
+                    break
+                time.sleep(0.02)
+            assert replica_db.get_meta(rep)["bootstrap_completed"] == 1
+            assert replica_db.is_ready(rep) is True
+        finally:
+            stop_flag.set()
+            t.join()
+
+        # 停写后确定性收敛
+        final_max = source_db.max_change_seq(src)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if replica_db.get_meta(rep)["last_applied_seq"] >= final_max:
+                break
+            time.sleep(0.02)
+        engine2.stop()
+        engine2.wait_until_idle(15)
+        assert replica_rows(rep) == source_rows(src)
+
+    def test_nonzero_progress_without_flag_is_not_allowed_through(self, tmp_path):
+        """旧副本/手工损坏副本：进度非零但 bootstrap_completed=0，
+        不能仅凭非零进度放行，必须保守重做。"""
+        src = str(tmp_path / "source.db")
+        rep = str(tmp_path / "replica.db")
+        source_db.init_demo(
+            src, rows=[(i, f"taxon-{i}", f"locality-{i}") for i in range(1, 7)]
+        )
+        # 直接构造一个带非零进度、就绪标记缺失的半成品副本
+        replica_db.init_replica(rep)
+        with replica_db.open_replica(rep) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO specimens VALUES (1, 'ghost', 'ghost town')")
+            conn.execute(
+                "UPDATE sync_meta SET phase = ?, last_applied_seq = 99,"
+                " source_max_seq = 99, bootstrap_completed = 0 WHERE id = 1",
+                (replica_db.PHASE_STOPPED,),
+            )
+            conn.execute("COMMIT")
+        assert replica_db.is_ready(rep) is False
+
+        run_engine(src, rep)
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 1
+        assert replica_rows(rep) == source_rows(src)
+        assert "ghost town" not in {v[1] for v in replica_rows(rep).values()}
+
+    def test_legacy_replica_without_flag_column_redo_bootstrap(self, tmp_path):
+        """旧版本副本文件没有 bootstrap_completed 列：在线迁移补 0，
+        无法证明首拷完成 -> 保守重做，而不是按 RUNNING+非零进度放行。"""
+        src = str(tmp_path / "source.db")
+        rep = str(tmp_path / "replica.db")
+        source_db.init_demo(
+            src, rows=[(i, f"taxon-{i}", f"locality-{i}") for i in range(1, 5)]
+        )
+        import sqlite3
+
+        conn = sqlite3.connect(rep)
+        conn.execute(
+            "CREATE TABLE specimens (id INTEGER PRIMARY KEY, taxon TEXT NOT NULL,"
+            " locality TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE sync_meta (id INTEGER PRIMARY KEY CHECK (id=1),"
+            " phase TEXT NOT NULL, last_applied_seq INTEGER NOT NULL DEFAULT 0,"
+            " source_max_seq INTEGER NOT NULL DEFAULT 0,"
+            " bootstrap_copied INTEGER NOT NULL DEFAULT 0, last_error TEXT,"
+            " updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        conn.execute(
+            "CREATE TABLE _applied_changes (seq INTEGER PRIMARY KEY, op TEXT NOT NULL,"
+            " specimen_id INTEGER NOT NULL,"
+            " applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        conn.execute("INSERT INTO specimens VALUES (1, 'stale', 'stale-loc')")
+        conn.execute(
+            "INSERT INTO sync_meta(id, phase, last_applied_seq, source_max_seq,"
+            " bootstrap_copied) VALUES (1, 'RUNNING', 3, 3, 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        # 迁移发生在引擎初始化副本结构时
+        replica_db.init_replica(rep)
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 0
+        assert replica_db.is_ready(rep) is False
+
+        run_engine(src, rep)
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 1
+        assert replica_rows(rep) == source_rows(src)
+        assert all(v[1] != "stale-loc" for v in replica_rows(rep).values())
+
+    def test_process_exit_mid_bootstrap_leaves_replica_unqueryable(self, tmp_path):
+        """真正的进程退出（os._exit，无 finally/清理）发生在首拷重放中途：
+        磁盘上的副本必须保持未发布；新进程重做后才就绪且数据一致。"""
+        import subprocess
+        import sys
+
+        src = str(tmp_path / "source.db")
+        rep = str(tmp_path / "replica.db")
+        worker = str(tmp_path / "worker.py")
+        source_db.init_source(src)
+        conn = source_db.connect(src)
+        for i in range(1, 41):  # 40 条登记 + 撤回 1 号 = 41 条日志
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO specimens VALUES (?, ?, ?)", (i, f"t{i}", f"l{i}")
+            )
+            conn.execute("COMMIT")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM specimens WHERE id = 1")
+        conn.execute("COMMIT")
+        conn.close()
+
+        # 子进程：小批次重放，提交若干批后立即硬退出（模拟进程被杀）
+        with open(worker, "w") as fh:
+            fh.write(
+                "import os, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import app.source_db as s\n"
+                "import app.sync as m\n"
+                "s.CHANGE_BATCH_SIZE = 5; m.CHANGE_BATCH_SIZE = 5\n"
+                "s.SNAPSHOT_PAGE_SIZE = 5; m.SNAPSHOT_PAGE_SIZE = 5\n"
+                "from app.sync import SyncEngine\n"
+                "src, rep = %r, %r\n"
+                "eng = SyncEngine(src, rep, poll_interval=0.01)\n"
+                "state = {'batches': 0}\n"
+                "def hook(seq):\n"
+                "    state['batches'] += 1\n"
+                "    if state['batches'] >= 2:\n"
+                "        os._exit(7)  # 硬退出：不执行任何 finally/flush 之外的清理\n"
+                "eng.after_batch_commit = hook\n"
+                "eng.start()\n"
+                "eng._thread.join()\n"
+                % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   src, rep)
+            )
+
+        proc = subprocess.run(
+            [sys.executable, worker], cwd=str(tmp_path), capture_output=True, timeout=30
+        )
+        assert proc.returncode == 7, proc.stderr.decode()
+
+        # 磁盘副本：进度可能非零，但就绪标记必须为 0、不可查
+        replica_db.init_replica(rep)
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 0
+        assert replica_db.is_ready(rep) is False
+        # get_specimen 是底层物理读；查询门由 is_ready 把守（Web 层返回 503），
+        # 因此即使物理行残留也不会对外发布
+        assert replica_db.is_ready(rep) is False
+
+        # 新进程（这里用新引擎实例等效）重做 -> 就绪、一致、1 号已撤回
+        run_engine(src, rep)
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 1
+        assert replica_rows(rep) == source_rows(src)
+        assert 1 not in replica_rows(rep)
+        assert len(replica_rows(rep)) == 39
+
 
 # --------------------------------------------------------------------------- #
 # 3. 增量同步
@@ -418,6 +709,92 @@ class TestIncremental:
         assert meta["phase"] == replica_db.PHASE_STOPPED
         assert meta["bootstrap_copied"] == 8  # 没有重新快照
         assert replica_rows(rep) == source_rows(src)
+
+    def test_empty_source_bootstrap_publishes_ready(self, tmp_path):
+        """空源库的首拷也必须正常发布：seq=0 但 bootstrap_completed=1，
+        副本就绪可查（查无标本时 404，而不是 503）。"""
+        src = str(tmp_path / "empty-source.db")
+        rep = str(tmp_path / "empty-replica.db")
+        source_db.init_source(src)
+        assert source_db.max_change_seq(src) == 0
+
+        engine = SyncEngine(src, rep, poll_interval=0.02)
+        engine.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            meta = replica_db.get_meta(rep)
+            if (
+                meta["bootstrap_completed"] == 1
+                and meta["phase"] == replica_db.PHASE_RUNNING
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            engine.stop()
+            pytest.fail("空库首拷未发布就绪")
+        meta = replica_db.get_meta(rep)
+        assert meta["bootstrap_completed"] == 1
+        assert meta["last_applied_seq"] == 0
+        assert replica_db.is_ready(rep) is True
+        engine.stop()
+        engine.wait_until_idle(10)
+
+    def test_completed_empty_replica_restarts_incrementally(self, tmp_path):
+        """已完成首拷的空库副本，重启必须增量续跑，绝不清空重建。"""
+        src = str(tmp_path / "empty-source.db")
+        rep = str(tmp_path / "empty-replica.db")
+        source_db.init_source(src)
+
+        engine = SyncEngine(src, rep, poll_interval=0.02)
+        engine.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if replica_db.get_meta(rep)["bootstrap_completed"] == 1:
+                break
+            time.sleep(0.01)
+        engine.stop()
+        engine.wait_until_idle(10)
+
+        # 新引擎实例模拟重启：监视 _bootstrap 不允许被调用
+        engine2 = SyncEngine(src, rep, poll_interval=0.02)
+        bootstrap_calls = []
+        original_bootstrap = engine2._bootstrap
+
+        def spy_bootstrap():
+            bootstrap_calls.append(1)
+            return original_bootstrap()
+
+        engine2._bootstrap = spy_bootstrap
+        engine2.start()
+        time.sleep(0.5)
+        meta = replica_db.get_meta(rep)
+        engine2.stop()
+        engine2.wait_until_idle(10)
+
+        assert bootstrap_calls == [], "已完成的空库副本重启不得重做 bootstrap"
+        assert meta["bootstrap_completed"] == 1
+        assert meta["last_applied_seq"] == 0
+        assert meta["bootstrap_copied"] == 0
+
+        # 空库就绪后源库写入第一条 -> 增量通道追上并可查
+        source_db.insert_specimen(src, 9, "first-after-empty", "loc-9")
+        engine3 = SyncEngine(src, rep, poll_interval=0.02)
+        engine3.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if replica_db.get_specimen(rep, 9) is not None:
+                break
+            time.sleep(0.02)
+        else:
+            engine3.stop()
+            pytest.fail("空库副本的首条增量未追上")
+        assert replica_db.get_specimen(rep, 9) == {
+            "id": 9,
+            "taxon": "first-after-empty",
+            "locality": "loc-9",
+        }
+        engine3.stop()
+        engine3.wait_until_idle(10)
 
 
 # --------------------------------------------------------------------------- #

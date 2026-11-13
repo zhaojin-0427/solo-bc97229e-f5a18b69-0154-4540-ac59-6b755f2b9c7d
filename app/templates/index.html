@@ -75,6 +75,8 @@
       <span class="v" id="lastSeq">—</span></div>
     <div class="row"><span class="k">源库当前最大序号</span><span class="v" id="srcMax">—</span></div>
     <div class="row"><span class="k">首次复制已拷贝行数</span><span class="v" id="copied">—</span></div>
+    <div class="row"><span class="k">首拷完成标记 (bootstrap_completed)</span>
+      <span class="v" id="bootDone">—</span></div>
     <div class="row"><span class="k">源库存量 / 已处理批次</span>
       <span class="v"><span id="srcCount">—</span> / <span id="batches">—</span></span></div>
     <div class="bar"><i id="bar"></i></div>
@@ -159,6 +161,8 @@ async function refresh() {
   $("lastSeq").textContent = data.last_applied_seq;
   $("srcMax").textContent = data.source_max_seq;
   $("copied").textContent = data.bootstrap_copied;
+  $("bootDone").textContent = data.bootstrap_completed
+    ? "1（已发布，可查询）" : "0（首拷未完成，副本不可查）";
   $("batches").textContent = data.total_batches;
   $("srcCount").textContent = data.source && data.source.specimen_count;
   $("error").textContent = data.last_error || "—";

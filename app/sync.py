@@ -28,10 +28,14 @@
 
 4. 原子性与续跑
    每批“数据变更 + sync_meta + _applied_changes”同一事务提交。
-   中断重启以持久化的 last_applied_seq 为准：
-     - 仍为 0（初次复制未完成）：重做 bootstrap（reset 后重来，幂等）；
-     - 大于 0（曾经就绪）：无论上次是 RUNNING/STOPPED/ERROR，都按持久
-       进度接续增量，绝不重做快照、绝不重复传播。
+   首拷完成的唯一权威凭证是 sync_meta.bootstrap_completed：它只在重放
+   全部完成、phase 切 RUNNING 的同一事务里置 1。中断重启以该标记为准：
+     - 标记为 0（初次复制未完成，哪怕 last_applied_seq 已非零）：
+       reset 后重做 bootstrap（幂等），期间副本一律不可查；
+     - 标记为 1（曾经就绪，含空库）：无论上次是 RUNNING/STOPPED/ERROR，
+       都按持久进度接续增量，绝不重做快照、绝不重复传播。
+   旧副本迁移后该列默认 0：无法证明首拷完成就保守重做，
+   绝不仅凭非零进度放行查询。
 
 5. 不阻塞源写入
    对源库全部使用只读短事务（自动提交下的 SELECT），WAL 允许读写并发；
@@ -65,6 +69,12 @@ class SyncEngine:
         # bootstrap 开始/完成事件，便于外部（如测试）确定性地观察阶段
         self.bootstrap_started = threading.Event()
         self.bootstrap_completed = threading.Event()
+        # 每批日志成功提交后的回调（参数为新的 last_applied_seq）。
+        # 仅供测试确定性地在“首拷重放中途”打断同步，生产环境不设置。
+        self.after_batch_commit = None
+        # 快照每一页成功提交后的回调（参数为累计已拷贝行数）。
+        # 仅供测试确定性地在“首拷快照中途”打断同步，生产环境不设置。
+        self.after_snapshot_page = None
         # 仅供 UI 展示的瞬时计数器（权威进度在副本 sync_meta 中）
         self._lock = threading.Lock()
         self._stats = {
@@ -153,18 +163,27 @@ class SyncEngine:
         replica_db.init_replica(self.replica_path)
         meta = replica_db.get_meta(self.replica_path)
 
-        # 只要曾经完成过初次复制（进度已持久化），无论上次是 RUNNING 还是
-        # STOPPED/ERROR 退出，重启都按持久进度接续，绝不重做快照。
-        # 只有初次复制未完成（last_applied_seq 仍为 0）时才重做 bootstrap。
-        if meta["last_applied_seq"] > 0:
+        # 只有持久标记 bootstrap_completed=1 才能证明首拷曾经完整完成。
+        # 绝不能用 last_applied_seq>0 代替：首拷重放途中每批都会把它推进到
+        # 非零，若此时进程退出，非零进度并不代表副本一致/就绪。
+        #   * 标记为 1（含空库首拷）：无论上次 RUNNING/STOPPED/ERROR，
+        #     都按持久进度接续增量，绝不重做快照；
+        #   * 标记为 0（未完成首拷，或旧副本迁移而来）：保守重做 bootstrap。
+        if int(meta.get("bootstrap_completed", 0)) == 1:
             self._mark_running()
             self._incremental_loop(meta["last_applied_seq"])
         else:
-            # 初次复制，或上次初次复制中断 -> 可安全重做
+            # 初次复制，或上次初次复制中断 -> 清空半成品后安全重做
             self._bootstrap()
-            self.bootstrap_completed.set()
-            meta = replica_db.get_meta(self.replica_path)
-            self._incremental_loop(meta["last_applied_seq"])
+            # 仅当首拷确实已原子发布（bootstrap_completed=1 落盘）才通知观察方；
+            # 中途停止/异常退出时标记保持 0，事件也不得置位。
+            if (
+                int(replica_db.get_meta(self.replica_path).get(
+                    "bootstrap_completed", 0)) == 1
+            ):
+                self.bootstrap_completed.set()
+                meta = replica_db.get_meta(self.replica_path)
+                self._incremental_loop(meta["last_applied_seq"])
 
     # ------------------------------------------------------------------ #
     # 初次复制
@@ -213,6 +232,8 @@ class SyncEngine:
                     )
                     rconn.execute("COMMIT")
                 last_id = rows[-1]["id"]
+                if self.after_snapshot_page is not None:
+                    self.after_snapshot_page(copied)
                 if len(rows) < SNAPSHOT_PAGE_SIZE:
                     break
 
@@ -259,10 +280,12 @@ class SyncEngine:
     # 日志重放（bootstrap 收尾与增量共用）
     # ------------------------------------------------------------------ #
     def _catch_up(self, target_seq: int) -> None:
-        """重放日志直到 last_applied_seq == target_seq，然后置为 RUNNING。
+        """重放日志直到 last_applied_seq == target_seq，然后原子发布就绪。
 
-        bootstrap 用它把快照与并发窗口的全部日志补齐；只有数据与进度
-        一起提交完成、副本真正一致后才进入 RUNNING（就绪前不供查询）。
+        bootstrap 用它把快照与并发窗口的全部日志补齐。只有数据、进度与
+        bootstrap_completed=1 在 *同一个事务* 提交完成、副本真正一致后才
+        进入 RUNNING（就绪前不供查询）；提交前任一时刻退出，标记都保持 0，
+        重启即重做 bootstrap。
         """
         last_seq = replica_db.get_meta(self.replica_path)["last_applied_seq"]
         while last_seq < target_seq:
@@ -276,19 +299,7 @@ class SyncEngine:
                 break
             last_seq = advanced
 
-        with replica_db.open_replica(self.replica_path) as rconn:
-            rconn.execute("BEGIN IMMEDIATE")
-            rconn.execute(
-                """
-                UPDATE sync_meta
-                   SET phase = ?, last_applied_seq = ?,
-                       source_max_seq = ?, last_error = NULL,
-                       updated_at = datetime('now')
-                 WHERE id = 1
-                """,
-                (replica_db.PHASE_RUNNING, target_seq, target_seq),
-            )
-            rconn.execute("COMMIT")
+        replica_db.mark_bootstrap_running(self.replica_path, target_seq)
 
     def _apply_batch(self, last_seq: int, target_seq: int) -> Optional[int]:
         """读取源端 (last_seq, target_seq] 的一批日志并原子应用。
@@ -358,6 +369,8 @@ class SyncEngine:
             self._stats["last_batch_at"] = time.time()
             self._stats["last_batch_changes"] = len(changes)
             self._stats["total_batches"] += 1
+        if self.after_batch_commit is not None:
+            self.after_batch_commit(new_last)
         return new_last
 
     # ------------------------------------------------------------------ #
@@ -397,7 +410,11 @@ class SyncEngine:
             rconn.execute("COMMIT")
 
     def _mark_running(self) -> None:
-        """重启续跑时把阶段从 STOPPED/ERROR 切回 RUNNING（进度保持不变）。"""
+        """重启续跑时把阶段从 STOPPED/ERROR 切回 RUNNING（进度保持不变）。
+
+        仅在 bootstrap_completed=1 的前提下由 _run 调用；这里不改就绪标记，
+        也绝不把未完成首拷的副本放入 RUNNING。
+        """
         with replica_db.open_replica(self.replica_path) as rconn:
             rconn.execute("BEGIN IMMEDIATE")
             rconn.execute(
@@ -406,6 +423,7 @@ class SyncEngine:
                    SET phase = ?, last_error = NULL,
                        updated_at = datetime('now')
                  WHERE id = 1
+                   AND bootstrap_completed = 1
                 """,
                 (replica_db.PHASE_RUNNING,),
             )
@@ -417,8 +435,9 @@ def sync_once(source_path: str, replica_path: str) -> dict:
     engine = SyncEngine(source_path, replica_path)
     replica_db.init_replica(replica_path)
     meta = replica_db.get_meta(replica_path)
-    # 与 _run 的续跑语义一致：只有从未完成初次复制时才做 bootstrap
-    if meta["last_applied_seq"] == 0:
+    # 与 _run 的续跑语义一致：只有持久标记证明首拷完成时才跳过 bootstrap，
+    # 非零进度但 bootstrap_completed=0 一律保守重做。
+    if int(meta.get("bootstrap_completed", 0)) == 0:
         engine._bootstrap()  # noqa: SLF001
     meta = replica_db.get_meta(replica_path)
     src = source_connect(source_path, readonly=True)
@@ -427,5 +446,7 @@ def sync_once(source_path: str, replica_path: str) -> dict:
     finally:
         src.close()
     if target > meta["last_applied_seq"]:
+        # 已就绪副本只追平新增日志；_catch_up 的发布语句是幂等的
+        # （bootstrap_completed 保持 1、phase 维持 RUNNING），不会重做快照。
         engine._catch_up(target)  # noqa: SLF001
     return replica_db.get_meta(replica_path)
